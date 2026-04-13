@@ -1,8 +1,19 @@
+import asyncio
+import os
+
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import Response
+from starlette.concurrency import run_in_threadpool
 from rembg import remove, new_session
 
 app = FastAPI(title="Framie Image Server", version="1.0.0")
+
+# rembg 처리 동시성을 제한해 CPU/메모리 급증을 완화한다.
+REMBG_MAX_CONCURRENCY = int(os.getenv("REMBG_MAX_CONCURRENCY", "2"))
+rembg_semaphore = asyncio.Semaphore(value=REMBG_MAX_CONCURRENCY)
+inflight = 0
+waiting = 0
+counter_lock = asyncio.Lock()
 
 # 사람 누끼 품질을 위해 u2net_human_seg 모델 사용.
 # 앱 시작 시 한 번만 로드하고 모든 요청에서 재사용.
@@ -28,28 +39,53 @@ def warmup_rembg():
 
 @app.get("/health")
 async def health_check():
-    return {"status": "ok"}
+    return {"status": "ok", "inflight": inflight, "waiting": waiting}
 
 
-# 동기 함수로 선언하여 FastAPI가 threadpool에서 실행하도록 한다.
-# (rembg는 CPU-bound라 async def 안에서 직접 호출하면 이벤트 루프를 블로킹함)
 @app.post("/remove-bg")
-def remove_background(image: UploadFile = File(...)):
+async def remove_background(image: UploadFile = File(...)):
+    global inflight, waiting
+
     if not image.content_type or not image.content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="이미지 파일만 업로드할 수 있습니다.")
 
+    acquired = False
     try:
-        input_bytes = image.file.read()
-        # remove()는 이미 PNG bytes를 반환하므로 재인코딩 없이 바로 응답.
-        output_bytes = remove(input_bytes, session=rembg_session)
+        input_bytes = await image.read()
+        async with counter_lock:
+            waiting += 1
+        try:
+            await asyncio.wait_for(rembg_semaphore.acquire(), timeout=20)
+            acquired = True
+        except TimeoutError as e:
+            raise HTTPException(
+                status_code=503,
+                detail="서버가 처리 중입니다. 잠시 후 다시 시도해주세요.",
+            ) from e
+        finally:
+            async with counter_lock:
+                waiting -= 1
+
+        async with counter_lock:
+            inflight += 1
+
+        # rembg는 CPU-bound라 이벤트 루프를 막지 않도록 threadpool로 위임한다.
+        output_bytes = await run_in_threadpool(remove, input_bytes, session=rembg_session)
 
         return Response(
             content=output_bytes,
             media_type="image/png",
             headers={"Content-Disposition": "inline; filename=removed_bg.png"},
         )
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"배경 제거 처리 중 오류: {str(e)}")
+    finally:
+        if acquired:
+            rembg_semaphore.release()
+            async with counter_lock:
+                inflight -= 1
 
 
 if __name__ == "__main__":
